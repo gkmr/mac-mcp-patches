@@ -1,5 +1,7 @@
 # mac-mcp-patches
 
+[![tests](https://github.com/gkmr/mac-mcp-patches/actions/workflows/tests.yml/badge.svg)](https://github.com/gkmr/mac-mcp-patches/actions/workflows/tests.yml) ![python](https://img.shields.io/badge/python-3.9%20%7C%203.12-blue) ![deps](https://img.shields.io/badge/dependencies-stdlib%20only-brightgreen) [![license](https://img.shields.io/badge/license-MIT-lightgrey)](LICENSE)
+
 Unofficial patches that stop two macOS MCP servers (iMessage and Apple Notes, shipped as Claude desktop extensions) from timing out, with an apply script that refuses to touch anything it was not built for.
 
 Not affiliated with or endorsed by Anthropic or Apple.
