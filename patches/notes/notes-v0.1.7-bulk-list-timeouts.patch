@@ -1,0 +1,138 @@
+Unofficial patch for the "Read and Write Apple Notes" Claude desktop extension.
+Target: server/index.js, extension manifest version 0.1.7
+(MCP server name in the file: "Apple-Notes-Server").
+Fixes: list_notes bulk fetch with quote-safe JSON, get_note_content
+contains-match fallback, timeouts on every osascript.
+Marker in patched file: Patched 2026-07-07
+Apply from the extension folder with: patch -p1 < this-file
+Details: docs/notes.md
+
+--- a/server/index.js
++++ b/server/index.js
+@@ -17,9 +17,10 @@
+   return String(error);
+ }
+ 
+-async function runAppleScript(script) {
++async function runAppleScript(script, timeoutMs = 0) {
+   try {
+-    const { stdout } = await execFileAsync("osascript", ["-e", script]);
++    const options = timeoutMs > 0 ? { timeout: timeoutMs, killSignal: "SIGKILL" } : {};
++    const { stdout } = await execFileAsync("osascript", ["-e", script], options);
+     return stdout.trim();
+   } catch (error) {
+     throw new Error(`AppleScript error: ${getErrorMessage(error)}`);
+@@ -132,6 +133,53 @@
+       const folder = request.params.arguments?.folder;
+       const limit = Number(request.params.arguments?.limit) || 20;
+ 
++      // Patched 2026-07-07: bulk-fetch implementation. One Apple Event per
++      // property list instead of four per note, JSON built in JS so quotes
++      // in titles cannot corrupt output, capped at 45s. Legacy loop below is
++      // only reached if this fails.
++      {
++        const src = folder ? `notes of folder ${JSON.stringify(folder)}` : "notes";
++        const script = `
++          set us to character id 31
++          set rs to character id 30
++          tell application "Notes"
++            set noteNames to name of ${src}
++            set noteIds to id of ${src}
++            set createDates to creation date of ${src}
++            set modDates to modification date of ${src}
++          end tell
++          set maxN to count of noteNames
++          if maxN > ${limit} then set maxN to ${limit}
++          set out to {}
++          repeat with i from 1 to maxN
++            set end of out to (item i of noteNames) & us & (item i of noteIds) & us & ((item i of createDates) as string) & us & ((item i of modDates) as string)
++          end repeat
++          set AppleScript's text item delimiters to rs
++          set outStr to out as string
++          set AppleScript's text item delimiters to ""
++          return outStr
++        `;
++        try {
++          const raw = await runAppleScript(script, 45000);
++          const notes = !raw
++            ? []
++            : raw.split("\x1E").map((rec) => {
++                const [name, id, creation_date, modification_date] = rec.split("\x1F");
++                return { name, id, creation_date, modification_date };
++              });
++          return {
++            content: [
++              {
++                type: "text",
++                text: JSON.stringify(notes, null, 2),
++              },
++            ],
++          };
++        } catch (error) {
++          console.error("Bulk list_notes failed, falling back to legacy loop:", getErrorMessage(error));
++        }
++      }
++
+       let script;
+       if (folder) {
+         script = `
+@@ -186,7 +234,7 @@
+       }
+ 
+       try {
+-        const results = await runAppleScript(script);
++        const results = await runAppleScript(script, 45000);
+         return {
+           content: [
+             {
+@@ -220,21 +268,29 @@
+       if (folder) {
+         script = `
+           tell application "Notes"
+-            set targetNote to first note of folder ${JSON.stringify(folder)} whose name is ${JSON.stringify(noteName)}
++            try
++              set targetNote to first note of folder ${JSON.stringify(folder)} whose name is ${JSON.stringify(noteName)}
++            on error
++              set targetNote to first note of folder ${JSON.stringify(folder)} whose name contains ${JSON.stringify(noteName)}
++            end try
+             return body of targetNote as string
+           end tell
+         `;
+       } else {
+         script = `
+           tell application "Notes"
+-            set targetNote to first note whose name is ${JSON.stringify(noteName)}
++            try
++              set targetNote to first note whose name is ${JSON.stringify(noteName)}
++            on error
++              set targetNote to first note whose name contains ${JSON.stringify(noteName)}
++            end try
+             return body of targetNote as string
+           end tell
+         `;
+       }
+ 
+       try {
+-        const content = await runAppleScript(script);
++        const content = await runAppleScript(script, 30000);
+         return {
+           content: [
+             {
+@@ -274,7 +330,7 @@
+       `;
+ 
+       try {
+-        const result = await runAppleScript(script);
++        const result = await runAppleScript(script, 30000);
+         return {
+           content: [
+             {
+@@ -325,7 +381,7 @@
+       }
+ 
+       try {
+-        const result = await runAppleScript(script);
++        const result = await runAppleScript(script, 30000);
+         return {
+           content: [
+             {

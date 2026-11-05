@@ -1,0 +1,255 @@
+Unofficial patch for the "Read and Send iMessages" Claude desktop extension.
+Target: server/index.js, extension manifest version 0.1.11
+(MCP server name in the file: "iMessage-AppleScript-Server").
+Fixes: search_contacts timeouts (SQLite fast path), contacts://all resource,
+send_imessage phone normalization + SMS fallback, timeouts on every osascript.
+Marker in patched file: searchContactsSQLite
+Apply from the extension folder with: patch -p1 < this-file
+Details: docs/imessage.md
+
+--- a/server/index.js
++++ b/server/index.js
+@@ -10,7 +10,7 @@
+ } from "@modelcontextprotocol/sdk/types.js";
+ import { execFile, exec } from "child_process";
+ import { promisify } from "util";
+-import { access } from "node:fs/promises";
++import { access, readdir } from "node:fs/promises";
+ 
+ const execFileAsync = promisify(execFile);
+ const execAsync = promisify(exec);
+@@ -26,9 +26,10 @@
+   return String(error);
+ }
+ 
+-async function runAppleScript(script) {
++async function runAppleScript(script, timeoutMs = 0) {
+   try {
+-    const { stdout } = await execFileAsync("osascript", ["-e", script]);
++    const options = timeoutMs > 0 ? { timeout: timeoutMs, killSignal: "SIGKILL" } : {};
++    const { stdout } = await execFileAsync("osascript", ["-e", script], options);
+     return stdout.trim();
+   } catch (error) {
+     throw new Error(`AppleScript error: ${getErrorMessage(error)}`);
+@@ -89,6 +90,106 @@
+   }
+ }
+ 
++// ---- Patched 2026-07-07: fast contact search via AddressBook SQLite ----
++// The original AppleScript loop makes several Apple Events round trips per
++// contact (thousands of contacts -> minutes of IPC) and times out. Querying
++// the AddressBook databases directly returns in milliseconds and relies on
++// the same Full Disk Access already required for chat.db. AppleScript
++// remains as a timeout-capped fallback only.
++
++async function findAddressBookDBs() {
++  const base = `${process.env.HOME}/Library/Application Support/AddressBook`;
++  const dbs = [];
++  try {
++    await access(`${base}/AddressBook-v22.abcddb`);
++    dbs.push(`${base}/AddressBook-v22.abcddb`);
++  } catch {}
++  try {
++    const sources = await readdir(`${base}/Sources`);
++    for (const source of sources) {
++      const dbPath = `${base}/Sources/${source}/AddressBook-v22.abcddb`;
++      try {
++        await access(dbPath);
++        dbs.push(dbPath);
++      } catch {}
++    }
++  } catch {}
++  return dbs;
++}
++
++function sqlEscapeLike(value) {
++  return String(value).replace(/'/g, "''").replace(/[%_\\]/g, "");
++}
++
++async function searchContactsSQLite(query, limit = 50) {
++  const dbs = await findAddressBookDBs();
++  if (dbs.length === 0) {
++    throw new Error("No AddressBook databases found");
++  }
++
++  const stripPhone = (col) =>
++    `replace(replace(replace(replace(replace(${col},' ',''),'-',''),'(',''),')',''),'.','')`;
++
++  const tokens = String(query).trim().split(/\s+/).filter(Boolean);
++  const tokenConds = tokens.map((rawToken) => {
++    const t = sqlEscapeLike(rawToken);
++    const digits = rawToken.replace(/[^0-9]/g, "");
++    let cond = `(r.ZFIRSTNAME LIKE '%${t}%' OR r.ZLASTNAME LIKE '%${t}%' OR r.ZNICKNAME LIKE '%${t}%' OR r.ZORGANIZATION LIKE '%${t}%' OR EXISTS(SELECT 1 FROM ZABCDEMAILADDRESS e2 WHERE e2.ZOWNER = r.Z_PK AND e2.ZADDRESS LIKE '%${t}%')`;
++    if (digits.length >= 3) {
++      cond += ` OR EXISTS(SELECT 1 FROM ZABCDPHONENUMBER p2 WHERE p2.ZOWNER = r.Z_PK AND ${stripPhone("p2.ZFULLNUMBER")} LIKE '%${digits}%')`;
++    }
++    return cond + ")";
++  });
++  const where = tokenConds.length > 0 ? tokenConds.join(" AND ") : "1=1";
++
++  const sql = `SELECT
++      COALESCE(r.ZFIRSTNAME,'') AS first,
++      COALESCE(r.ZLASTNAME,'') AS last,
++      COALESCE(r.ZNICKNAME,'') AS nick,
++      COALESCE(r.ZORGANIZATION,'') AS org,
++      (SELECT group_concat(p.ZFULLNUMBER,'||') FROM ZABCDPHONENUMBER p WHERE p.ZOWNER = r.Z_PK) AS phones,
++      (SELECT group_concat(e.ZADDRESS,'||') FROM ZABCDEMAILADDRESS e WHERE e.ZOWNER = r.Z_PK) AS emails
++    FROM ZABCDRECORD r
++    WHERE ${where}
++    LIMIT ${Number(limit) || 50};`;
++
++  const seen = new Set();
++  const results = [];
++  let okCount = 0;
++  for (const db of dbs) {
++    try {
++      const { stdout } = await execFileAsync(
++        "sqlite3",
++        ["-readonly", "-json", "-cmd", ".timeout 2000", db, sql],
++        { timeout: 10000 }
++      );
++      okCount++;
++      if (!stdout.trim()) continue;
++      for (const row of JSON.parse(stdout)) {
++        const name =
++          [row.first, row.last].filter(Boolean).join(" ").trim() ||
++          row.nick || row.org || "";
++        const phones = row.phones ? row.phones.split("||").filter(Boolean) : [];
++        const emails = row.emails ? row.emails.split("||").filter(Boolean) : [];
++        if (!name && phones.length === 0 && emails.length === 0) continue;
++        const key = `${name.toLowerCase()}|${phones.join(",")}|${emails.join(",")}`;
++        if (seen.has(key)) continue;
++        seen.add(key);
++        const contact = { name: name || "Unknown", phones, emails };
++        if (row.nick) contact.nickname = row.nick;
++        if (row.org) contact.organization = row.org;
++        results.push(contact);
++      }
++    } catch (error) {
++      console.error(`AddressBook query failed for ${db}: ${getErrorMessage(error)}`);
++    }
++  }
++  if (okCount === 0) {
++    throw new Error("All AddressBook database queries failed");
++  }
++  return results;
++}
++
+ function decodeAttributedBody(hexString) {
+   try {
+     // Convert hex to buffer
+@@ -478,8 +579,24 @@
+     end tell
+   `;
+ 
++  // Patched: fast path via AddressBook SQLite; AppleScript fallback capped at 60s.
++  try {
++    const contacts = await searchContactsSQLite("", 10000);
++    return {
++      contents: [
++        {
++          uri: request.params.uri,
++          mimeType: "application/json",
++          text: JSON.stringify(contacts, null, 2),
++        },
++      ],
++    };
++  } catch (error) {
++    console.error("SQLite contact list failed, falling back to AppleScript:", getErrorMessage(error));
++  }
++
+   try {
+-    const contacts = await runAppleScript(script);
++    const contacts = await runAppleScript(script, 60000);
+     return {
+       contents: [
+         {
+@@ -604,19 +721,42 @@
+         throw new Error("Recipient and message are required");
+       }
+ 
++      // Patched 2026-07-07: normalize phone recipients, fall back to SMS for
++      // non-iMessage recipients (requires Text Message Forwarding), and cap
++      // the send at 15s so it can never hang the tool.
++      let target = String(recipient).trim();
++      if (!target.includes("@")) {
++        const cleaned = target.replace(/[^0-9+]/g, "");
++        target = cleaned.replace(/^\+/, "").length >= 10 ? normalizePhoneNumber(cleaned)[0] : cleaned;
++      }
++
+       const script = `
+         tell application "Messages"
+-          send ${JSON.stringify(message)} to buddy ${JSON.stringify(recipient)} of (service 1 whose service type = iMessage)
++          try
++            set targetService to 1st account whose service type = iMessage
++            set targetBuddy to participant ${JSON.stringify(target)} of targetService
++            send ${JSON.stringify(message)} to targetBuddy
++            return "iMessage"
++          on error primaryErr
++            try
++              set smsService to 1st account whose service type = SMS
++              set smsBuddy to participant ${JSON.stringify(target)} of smsService
++              send ${JSON.stringify(message)} to smsBuddy
++              return "SMS"
++            on error smsErr
++              error "iMessage failed (" & primaryErr & "); SMS fallback failed (" & smsErr & ")"
++            end try
++          end try
+         end tell
+       `;
+ 
+       try {
+-        await runAppleScript(script);
++        const via = await runAppleScript(script, 15000);
+         return {
+           content: [
+             {
+               type: "text",
+-              text: `Message sent successfully to ${recipient}`,
++              text: `Message sent successfully to ${target} via ${via || "iMessage"}`,
+             },
+           ],
+         };
+@@ -634,14 +774,30 @@
+     }
+ 
+     case "search_contacts": {
+-      const query = String(request.params.arguments?.query).toLowerCase();
++      const query = String(request.params.arguments?.query ?? "").trim().toLowerCase();
++
++      // Patched: fast path via AddressBook SQLite (~10ms). The AppleScript
++      // below is only a fallback and is capped at 25s so it can never hang.
++      try {
++        const contacts = await searchContactsSQLite(query);
++        return {
++          content: [
++            {
++              type: "text",
++              text: JSON.stringify(contacts, null, 2),
++            },
++          ],
++        };
++      } catch (error) {
++        console.error("SQLite contact search failed, falling back to AppleScript:", getErrorMessage(error));
++      }
+ 
+       const script = `
+         tell application "Contacts"
+           set output to "["
+           set isFirst to true
+-          repeat with p in every person
+-            if ((name of p as text) contains ${JSON.stringify(query)}) then
++          repeat with p in (every person whose name contains ${JSON.stringify(query)})
++            if (true) then
+               if not isFirst then
+                 set output to output & ","
+               end if
+@@ -676,7 +832,7 @@
+       `;
+ 
+       try {
+-        const results = await runAppleScript(script);
++        const results = await runAppleScript(script, 25000);
+         return {
+           content: [
+             {

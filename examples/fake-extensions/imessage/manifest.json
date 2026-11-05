@@ -1,0 +1,5 @@
+{
+  "name": "fake-imessage",
+  "version": "0.0.0-example",
+  "description": "Synthetic stand-in for the iMessage extension. It only has the fingerprint, so apply-patch.sh finds it and then refuses it."
+}

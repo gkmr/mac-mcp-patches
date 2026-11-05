@@ -1,0 +1,17 @@
+# upstream files you supply for the tests (not redistributed)
+tests/upstream/
+
+# patch leftovers
+*.orig
+*.rej
+*.bak
+*.pre-v*
+
+# python
+__pycache__/
+*.pyc
+
+# misc
+.DS_Store
+.state/
+node_modules/

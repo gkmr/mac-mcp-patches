@@ -1,0 +1,5 @@
+{
+  "name": "fake-notes",
+  "version": "0.0.0-example",
+  "description": "Synthetic stand-in for the Apple Notes extension. It only has the fingerprint, so apply-patch.sh finds it and then refuses it."
+}
